@@ -61,6 +61,7 @@ const (
 	maxProgressiveSteps                   = 4
 	charset                               = "abcdefghijklmnopqrstuvwxyz" +
 		"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	DEFAULT_UNLIMITED_LIMIT = "999999999"
 )
 
 var (
@@ -77,7 +78,7 @@ type PinotClient struct {
 }
 
 func (r *PinotClient) ControllerQuery(ctx context.Context, query string) (PinotResponseTable, error) {
-	zap.S().Error("Querying: %s", query)
+	zap.S().Info("Querying Pinot: %s", query)
 	sqlReq := map[string]string{"sql": query}
 	jsonReq, err := json.Marshal(sqlReq)
 
@@ -199,6 +200,8 @@ func NewReader(localDB *sqlx.DB, configFile string) *PinotReader {
 		alertManager: alertManager,
 		traceDB:      signozTraceDBName,
 		indexTable:   signozTraceTableName,
+		spansTable:   signozSpansTable,
+		errorTable:   signozErrorIndexTable,
 	}
 }
 
@@ -658,7 +661,7 @@ func (r *PinotReader) GetServicesList(ctx context.Context) (*[]string, error) {
 
 	// TODO check the where clause support
 	services := []string{}
-	query := fmt.Sprintf(`SELECT DISTINCT serviceName FROM %s`, r.indexTable)
+	query := fmt.Sprintf(`SELECT DISTINCT serviceName FROM %s LIMIT %s`, r.indexTable, DEFAULT_UNLIMITED_LIMIT)
 
 	rows, err := r.db.ControllerQuery(ctx, query)
 
@@ -686,13 +689,13 @@ func (r *PinotReader) GetServices(ctx context.Context, queryParams *model.GetSer
 
 	serviceItems := []model.ServiceItem{}
 
-	query := fmt.Sprintf("SELECT serviceName, percentileest(durationNanos, 99) as p99, avg(durationNanos) as avgDuration, count(*) as numCalls FROM %s WHERE \"timestamp\">=%s AND \"timestamp\"<=%s AND kind='2'", r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10))
+	query := fmt.Sprintf("SELECT serviceName, percentileest(durationNano, 99) as p99, avg(durationNano) as avgDuration, count(*) as numCalls FROM %s WHERE \"timestamp\">=%s AND \"timestamp\"<=%s AND kind='2'", r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10))
 	// args := []interface{}{}
 	// args, errStatus := buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
 	// if errStatus != nil {
 	// 	return nil, errStatus
 	// }
-	query += " GROUP BY serviceName ORDER BY p99 DESC"
+	query += " GROUP BY serviceName ORDER BY p99 DESC LIMIT " + DEFAULT_UNLIMITED_LIMIT
 	rows, err := r.db.ControllerQuery(ctx, query)
 
 	for _, row := range rows.rows {
@@ -722,7 +725,7 @@ func (r *PinotReader) GetServices(ctx context.Context, queryParams *model.GetSer
 	// if errStatus != nil {
 	// 	return nil, errStatus
 	// }
-	query += " GROUP BY serviceName"
+	query += " GROUP BY serviceName LIMIT " + DEFAULT_UNLIMITED_LIMIT
 	rows, err = r.db.ControllerQuery(ctx, query)
 
 	for _, row := range rows.rows {
@@ -730,7 +733,7 @@ func (r *PinotReader) GetServices(ctx context.Context, queryParams *model.GetSer
 
 		serviceErrorItems = append(serviceErrorItems, model.ServiceItem{
 			ServiceName: _r[0].(string),
-			NumErrors:   _r[1].(uint64),
+			NumErrors:   uint64(_r[1].(float64)),
 		})
 	}
 
@@ -758,7 +761,7 @@ func (r *PinotReader) GetServices(ctx context.Context, queryParams *model.GetSer
 	// if errStatus != nil {
 	// 	return nil, errStatus
 	// }
-	query += " GROUP BY serviceName"
+	query += " GROUP BY serviceName LIMIT " + DEFAULT_UNLIMITED_LIMIT
 	rows, err = r.db.ControllerQuery(ctx, query)
 
 	for _, row := range rows.rows {
@@ -766,7 +769,7 @@ func (r *PinotReader) GetServices(ctx context.Context, queryParams *model.GetSer
 
 		service4xxItems = append(service4xxItems, model.ServiceItem{
 			ServiceName: _r[0].(string),
-			NumErrors:   _r[1].(uint64),
+			NumErrors:   uint64(_r[1].(float64)),
 		})
 	}
 
@@ -802,13 +805,13 @@ func (r *PinotReader) GetServiceOverview(ctx context.Context, queryParams *model
 
 	serviceOverviewItems := []model.ServiceOverviewItem{}
 
-	query := fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", percentileest(durationNanos, 50) as p50, percentileest(durationNanos, 95) as p95, percentileest(durationNanos, 99) as p99, count(*) as numCalls FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s AND kind = '2' AND serviceName = '%s'", r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10), queryParams.ServiceName)
+	query := fmt.Sprintf("SELECT DATETIMECONVERT(\"timestamp\", '1:NANOSECONDS:EPOCH', '1:MINUTES:EPOCH', '%s:MINUTES') AS \"time\", percentileest(durationNano, 50) as p50, percentileest(durationNano, 95) as p95, percentileest(durationNano, 99) as p99, count(*) as numCalls FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s AND kind = '2' AND serviceName = '%s'", strconv.Itoa(int(queryParams.StepSeconds/60)), r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10), queryParams.ServiceName)
 	// args := []interface{}{}
 	// args, errStatus := buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
 	// if errStatus != nil {
 	// 	return nil, errStatus
 	// }
-	query += " GROUP BY \"time\" ORDER BY \"time\" DESC"
+	query += " GROUP BY \"time\" ORDER BY \"time\" DESC LIMIT " + DEFAULT_UNLIMITED_LIMIT
 	rows, err := r.db.ControllerQuery(ctx, query)
 
 	for _, row := range rows.rows {
@@ -832,13 +835,13 @@ func (r *PinotReader) GetServiceOverview(ctx context.Context, queryParams *model
 
 	serviceErrorItems := []model.ServiceErrorItem{}
 
-	query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", count(*) as numErrors FROM %s WHERE \"timestamp\">=%s AND \"timestamp\"<=%s AND kind='2' AND serviceName='%s' AND hasError=true", r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10), queryParams.ServiceName)
+	query = fmt.Sprintf("SELECT DATETIMECONVERT(\"timestamp\", '1:NANOSECONDS:EPOCH', '1:MINUTES:EPOCH', '%s:MINUTES') AS \"time\", count(*) as numErrors FROM %s WHERE \"timestamp\">=%s AND \"timestamp\"<=%s AND kind='2' AND serviceName='%s' AND hasError=true", strconv.Itoa(int(queryParams.StepSeconds/60)), r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10), queryParams.ServiceName)
 	// args = []interface{}{}
 	// args, errStatus = buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
 	// if errStatus != nil {
 	// 	return nil, errStatus
 	// }
-	query += " GROUP BY \"time\" ORDER BY \"time\" DESC"
+	query += " GROUP BY \"time\" ORDER BY \"time\" DESC LIMIT " + DEFAULT_UNLIMITED_LIMIT
 	rows, err = r.db.ControllerQuery(ctx, query)
 
 	for _, row := range rows.rows {
@@ -946,10 +949,10 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 	}
 
 	if len(queryParams.MinDuration) != 0 {
-		query = query + " AND durationNanos >= " + queryParams.MinDuration
+		query = query + " AND durationNano >= " + queryParams.MinDuration
 	}
 	if len(queryParams.MaxDuration) != 0 {
-		query = query + " AND durationNanos <= " + queryParams.MinDuration
+		query = query + " AND durationNano <= " + queryParams.MaxDuration
 	}
 
 	query = getStatusFilters(query, queryParams.Status, excludeMap)
@@ -974,7 +977,7 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 		case constants.ServiceName:
 			finalQuery := fmt.Sprintf("SELECT serviceName, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
-			finalQuery += " GROUP BY serviceName"
+			finalQuery += " GROUP BY serviceName LIMIT " + DEFAULT_UNLIMITED_LIMIT
 			var dBResponse []model.DBResponseServiceName
 			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
@@ -999,7 +1002,7 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 		case constants.HttpCode:
 			finalQuery := fmt.Sprintf("SELECT httpCode, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
-			finalQuery += " GROUP BY httpCode"
+			finalQuery += " GROUP BY httpCode LIMIT " + DEFAULT_UNLIMITED_LIMIT
 			var dBResponse []model.DBResponseHttpCode
 			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
@@ -1024,7 +1027,7 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 		case constants.HttpRoute:
 			finalQuery := fmt.Sprintf("SELECT httpRoute, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
-			finalQuery += " GROUP BY httpRoute"
+			finalQuery += " GROUP BY httpRoute LIMIT " + DEFAULT_UNLIMITED_LIMIT
 			var dBResponse []model.DBResponseHttpRoute
 			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
@@ -1049,7 +1052,7 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 		case constants.HttpUrl:
 			finalQuery := fmt.Sprintf("SELECT httpUrl, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
-			finalQuery += " GROUP BY httpUrl"
+			finalQuery += " GROUP BY httpUrl LIMIT " + DEFAULT_UNLIMITED_LIMIT
 			var dBResponse []model.DBResponseHttpUrl
 			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
@@ -1073,7 +1076,7 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 		case constants.HttpMethod:
 			finalQuery := fmt.Sprintf("SELECT httpMethod, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
-			finalQuery += " GROUP BY httpMethod"
+			finalQuery += " GROUP BY httpMethod LIMIT " + DEFAULT_UNLIMITED_LIMIT
 			var dBResponse []model.DBResponseHttpMethod
 			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
@@ -1098,7 +1101,7 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 		case constants.HttpHost:
 			finalQuery := fmt.Sprintf("SELECT httpHost, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
-			finalQuery += " GROUP BY httpHost"
+			finalQuery += " GROUP BY httpHost LIMIT " + DEFAULT_UNLIMITED_LIMIT
 			var dBResponse []model.DBResponseHttpHost
 			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
@@ -1123,7 +1126,7 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 		case constants.OperationRequest:
 			finalQuery := fmt.Sprintf("SELECT name, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
-			finalQuery += " GROUP BY name"
+			finalQuery += " GROUP BY name LIMIT " + DEFAULT_UNLIMITED_LIMIT
 			var dBResponse []model.DBResponseOperation
 			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
@@ -1148,7 +1151,7 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 		case constants.Component:
 			finalQuery := fmt.Sprintf("SELECT component, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
-			finalQuery += " GROUP BY component"
+			finalQuery += " GROUP BY component LIMIT " + DEFAULT_UNLIMITED_LIMIT
 			var dBResponse []model.DBResponseComponent
 			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
@@ -1173,6 +1176,7 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 		case constants.Status:
 			finalQuery := fmt.Sprintf("SELECT COUNT(*) as numTotal FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s AND hasError = true", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
+			finalQuery += " LIMIT " + DEFAULT_UNLIMITED_LIMIT
 			var dBResponse []model.DBResponseTotal
 			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
@@ -1189,11 +1193,12 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 				return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("Error in processing sql query: %s", err)}
 			}
 
-			finalQuery2 := fmt.Sprintf("SELECT COUNT(*) as numTotal FROM %s WHERE timestamp >= %s AND timestamp <= %s AND hasError = false", r.indexTable, startTimeNanos, endTimeNanos)
+			finalQuery2 := fmt.Sprintf("SELECT COUNT(*) as numTotal FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s AND hasError = false ", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery2 += query
+			finalQuery2 += " LIMIT " + DEFAULT_UNLIMITED_LIMIT
 			var dBResponse2 []model.DBResponseTotal
-			rows, err = r.db.ControllerQuery(ctx, finalQuery)
-			zap.S().Info(finalQuery)
+			rows, err = r.db.ControllerQuery(ctx, finalQuery2)
+			zap.S().Info(finalQuery2)
 
 			for _, row := range rows.rows {
 				_r := row.([]interface{})
@@ -1216,9 +1221,9 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 				traceFilterReponse.Status = map[string]uint64{"ok": 0, "error": 0}
 			}
 		case constants.Duration:
-			finalQuery := fmt.Sprintf("SELECT durationNanos as numTotal FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
+			finalQuery := fmt.Sprintf("SELECT durationNano as numTotal FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
-			finalQuery += " ORDER BY durationNanos LIMIT 1"
+			finalQuery += " ORDER BY durationNano LIMIT 1"
 			var dBResponse []model.DBResponseTotal
 			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
@@ -1234,9 +1239,9 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 				zap.S().Debug("Error in processing sql query: ", err)
 				return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("Error in processing sql query: %s", err)}
 			}
-			finalQuery = fmt.Sprintf("SELECT durationNanos as numTotal FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
+			finalQuery = fmt.Sprintf("SELECT durationNano as numTotal FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
-			finalQuery += " ORDER BY durationNanos DESC LIMIT 1"
+			finalQuery += " ORDER BY durationNano DESC LIMIT 1"
 			var dBResponse2 []model.DBResponseTotal
 			rows, err = r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
@@ -1261,7 +1266,7 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 		case constants.RPCMethod:
 			finalQuery := fmt.Sprintf("SELECT rpcMethod, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
-			finalQuery += " GROUP BY rpcMethod"
+			finalQuery += " GROUP BY rpcMethod LIMIT " + DEFAULT_UNLIMITED_LIMIT
 			var dBResponse []model.DBResponseRPCMethod
 			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
@@ -1287,7 +1292,7 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 		case constants.ResponseStatusCode:
 			finalQuery := fmt.Sprintf("SELECT responseStatusCode, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
-			finalQuery += " GROUP BY responseStatusCode"
+			finalQuery += " GROUP BY responseStatusCode LIMIT " + DEFAULT_UNLIMITED_LIMIT
 			var dBResponse []model.DBResponseStatusCodeMethod
 			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
@@ -1390,10 +1395,10 @@ func (r *PinotReader) GetFilteredSpans(ctx context.Context, queryParams *model.G
 	}
 
 	if len(queryParams.MinDuration) != 0 {
-		query = query + " AND durationNanos >= " + queryParams.MinDuration
+		query = query + " AND durationNano >= " + queryParams.MinDuration
 	}
 	if len(queryParams.MaxDuration) != 0 {
-		query = query + " AND durationNanos <= " + queryParams.MaxDuration
+		query = query + " AND durationNano <= " + queryParams.MaxDuration
 	}
 	query = getStatusFilters(query, queryParams.Status, excludeMap)
 
@@ -1409,10 +1414,10 @@ func (r *PinotReader) GetFilteredSpans(ctx context.Context, queryParams *model.G
 	if len(queryParams.OrderParam) != 0 {
 		if queryParams.OrderParam == constants.Duration {
 			if queryParams.Order == constants.Descending {
-				query = query + " ORDER BY durationNanos DESC"
+				query = query + " ORDER BY durationNano DESC"
 			}
 			if queryParams.Order == constants.Ascending {
-				query = query + " ORDER BY durationNanos ASC"
+				query = query + " ORDER BY durationNano ASC"
 			}
 		} else if queryParams.OrderParam == constants.Timestamp {
 			if queryParams.Order == constants.Descending {
@@ -1424,17 +1429,18 @@ func (r *PinotReader) GetFilteredSpans(ctx context.Context, queryParams *model.G
 		}
 	}
 	if queryParams.Limit > 0 {
-		query = query + " LIMIT " + strconv.FormatInt(queryParams.Limit, 10)
+		if queryParams.Offset > 0 {
+			query = query + " LIMIT " + strconv.FormatInt(queryParams.Offset, 10) + ", " + strconv.FormatInt(queryParams.Limit, 10)
+		} else {
+			query = query + " LIMIT " + strconv.FormatInt(queryParams.Limit, 10)
+		}
+	} else {
+		query = query + " LIMIT " + DEFAULT_UNLIMITED_LIMIT
 	}
-
-	// if queryParams.Offset > 0 {
-	// 	query = query + " OFFSET @offset"
-	// 	args = append(args, clickhouse.Named("offset", queryParams.Offset))
-	// }
 
 	var getFilterSpansResponseItems []model.GetFilterSpansResponseItem
 
-	baseQuery := fmt.Sprintf("SELECT \"timestamp\", spanID, traceID, serviceName, name, durationNanos, httpCode, gRPCCode, gRPCMethod, httpMethod, rpcMethod, responseStatusCode FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", queryTable, startTimeNanos, endTimeNanos)
+	baseQuery := fmt.Sprintf("SELECT \"timestamp\", spanID, traceID, serviceName, name, durationNano, httpCode, gRPCCode, gRPCMethod, httpMethod, rpcMethod, responseStatusCode FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", queryTable, startTimeNanos, endTimeNanos)
 	baseQuery += query
 
 	rows, err := r.db.ControllerQuery(ctx, baseQuery)
@@ -1549,7 +1555,88 @@ func buildQueryWithTagParams(ctx context.Context, tags []model.TagQuery, query *
 }
 
 func (r *PinotReader) GetTagFilters(ctx context.Context, queryParams *model.TagFilterParams) (*[]model.TagFilters, *model.ApiError) {
-	return nil, &model.ApiError{model.ErrorNotImplemented, fmt.Errorf("Pinot does not support operation")}
+
+	startTimeNanos := strconv.FormatInt(queryParams.Start.UnixNano(), 10)
+	endTimeNanos := strconv.FormatInt(queryParams.End.UnixNano(), 10)
+
+	excludeMap := make(map[string]struct{})
+	for _, e := range queryParams.Exclude {
+		if e == constants.OperationRequest {
+			excludeMap[constants.OperationDB] = struct{}{}
+			continue
+		}
+		excludeMap[e] = struct{}{}
+	}
+
+	var query string
+	args := []interface{}{}
+	if len(queryParams.ServiceName) > 0 {
+		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.ServiceName, constants.ServiceName, &query, args)
+	}
+	if len(queryParams.HttpRoute) > 0 {
+		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.HttpRoute, constants.HttpRoute, &query, args)
+	}
+	if len(queryParams.HttpCode) > 0 {
+		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.HttpCode, constants.HttpCode, &query, args)
+	}
+	if len(queryParams.HttpHost) > 0 {
+		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.HttpHost, constants.HttpHost, &query, args)
+	}
+	if len(queryParams.HttpMethod) > 0 {
+		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.HttpMethod, constants.HttpMethod, &query, args)
+	}
+	if len(queryParams.HttpUrl) > 0 {
+		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.HttpUrl, constants.HttpUrl, &query, args)
+	}
+	if len(queryParams.Component) > 0 {
+		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.Component, constants.Component, &query, args)
+	}
+	if len(queryParams.Operation) > 0 {
+		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.Operation, constants.OperationDB, &query, args)
+	}
+	if len(queryParams.RPCMethod) > 0 {
+		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.RPCMethod, constants.RPCMethod, &query, args)
+	}
+	if len(queryParams.ResponseStatusCode) > 0 {
+		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.ResponseStatusCode, constants.ResponseStatusCode, &query, args)
+	}
+	if len(queryParams.MinDuration) != 0 {
+		query = query + " AND durationNano >= " + queryParams.MinDuration
+	}
+	if len(queryParams.MaxDuration) != 0 {
+		query = query + " AND durationNano <= " + queryParams.MaxDuration
+	}
+
+	query = getStatusFilters(query, queryParams.Status, excludeMap)
+	query = query + " LIMIT " + DEFAULT_UNLIMITED_LIMIT
+
+	tagFilters := []model.TagFilters{}
+
+	finalQuery := fmt.Sprintf(`select JSONEXTRACTKEY(tagMap, '$.*') as tagKeys FROM %s WHERE "timestamp" >= %s AND "timestamp" <= %s`, r.indexTable, startTimeNanos, endTimeNanos)
+	// Alternative query: SELECT groupUniqArrayArray(mapKeys(tagMap)) as tagKeys  FROM signoz_index_v2
+	finalQuery += query
+	rows, err := r.db.ControllerQuery(ctx, finalQuery)
+
+	for _, row := range rows.rows {
+		_r := row.([]interface{})
+		keys := _r[0].([]interface{})
+
+		for _, k := range keys {
+			tagFilters = append(tagFilters, model.TagFilters{
+				TagKeys: k.(string),
+			})
+		}
+	}
+
+	zap.S().Info(query)
+
+	if err != nil {
+		zap.S().Debug("Error in processing sql query: ", err)
+		return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("Error in processing sql query")}
+	}
+	tagFilters = excludeTags(ctx, tagFilters)
+
+	return &tagFilters, nil
 }
 
 func excludeTags(ctx context.Context, tags []model.TagFilters) []model.TagFilters {
@@ -1584,13 +1671,13 @@ func (r *PinotReader) GetTopEndpoints(ctx context.Context, queryParams *model.Ge
 
 	var topEndpointsItems []model.TopEndpointsItem
 
-	query := fmt.Sprintf("SELECT percentileest(durationNanos, 50) as p50, percentileest(durationNanos, 95) as p95, percentileest(durationNanos, 99) as p99, COUNT(*) as numCalls, name  FROM %s WHERE  \"timestamp\" >= %s AND \"timestamp\" <= %s AND  kind='2' and serviceName='%s'", r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10), queryParams.ServiceName)
+	query := fmt.Sprintf("SELECT percentileest(durationNano, 50) as p50, percentileest(durationNano, 95) as p95, percentileest(durationNano, 99) as p99, COUNT(*) as numCalls, name  FROM %s WHERE  \"timestamp\" >= %s AND \"timestamp\" <= %s AND  kind='2' and serviceName='%s'", r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10), queryParams.ServiceName)
 	// args := []interface{}{}
 	// args, errStatus := buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
 	// if errStatus != nil {
 	// 	return nil, errStatus
 	// }
-	query += " GROUP BY name"
+	query += " GROUP BY name LIMIT " + DEFAULT_UNLIMITED_LIMIT
 	rows, err := r.db.ControllerQuery(ctx, query)
 
 	for _, row := range rows.rows {
@@ -1625,9 +1712,9 @@ func (r *PinotReader) GetUsage(ctx context.Context, queryParams *model.GetUsageP
 
 	var query string
 	if len(queryParams.ServiceName) != 0 {
-		query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') as \"time\", count(*) as count FROM %s WHERE serviceName='%s' AND \"timestamp\">=%s AND \"timestamp\"<=%s GROUP BY \"time\" ORDER BY \"time\" ASC", r.indexTable, queryParams.ServiceName, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10))
+		query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') as \"time\", count(*) as count FROM %s WHERE serviceName='%s' AND \"timestamp\">=%s AND \"timestamp\"<=%s GROUP BY \"time\" ORDER BY \"time\" ASC LIMIT %s", r.indexTable, queryParams.ServiceName, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10), DEFAULT_UNLIMITED_LIMIT)
 	} else {
-		query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') as \"time\", count(1) as count FROM %s WHERE \"timestamp\">=%s AND \"timestamp\"<=%s GROUP BY \"time\" ORDER BY \"time\" ASC", r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10))
+		query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') as \"time\", count(1) as count FROM %s WHERE \"timestamp\">=%s AND \"timestamp\"<=%s GROUP BY \"time\" ORDER BY \"time\" ASC LIMIT %s", r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10), DEFAULT_UNLIMITED_LIMIT)
 	}
 
 	rows, err := r.db.ControllerQuery(ctx, query)
@@ -1669,7 +1756,7 @@ func (r *PinotReader) SearchTraces(ctx context.Context, traceId string) (*[]mode
 
 	var searchScanReponses []model.SearchSpanDBReponseItem
 
-	query := fmt.Sprintf("SELECT \"timestamp\", traceID, model FROM %s WHERE traceID='%s'", r.spansTable, traceId)
+	query := fmt.Sprintf("SELECT \"timestamp\", traceID, model FROM %s WHERE traceID='%s' LIMIT %s", r.spansTable, traceId, DEFAULT_UNLIMITED_LIMIT)
 
 	rows, err := r.db.ControllerQuery(ctx, query)
 
@@ -1718,7 +1805,7 @@ func interfaceArrayToStringArray(array []interface{}) []string {
 func (r *PinotReader) GetServiceMapDependencies(ctx context.Context, queryParams *model.GetServicesParams) (*[]model.ServiceMapDependencyResponseItem, error) {
 	serviceMapDependencyItems := []model.ServiceMapDependencyItem{}
 
-	query := fmt.Sprintf(`SELECT spanID, parentSpanID, serviceName FROM %s WHERE \"timestamp\">=%s AND \"timestamp\"<=%s`, r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10))
+	query := fmt.Sprintf(`SELECT spanID, parentSpanID, serviceName FROM %s WHERE "timestamp">=%s AND "timestamp"<=%s LIMIT %s`, r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10), DEFAULT_UNLIMITED_LIMIT)
 
 	rows, err := r.db.ControllerQuery(ctx, query)
 
@@ -1786,13 +1873,13 @@ func (r *PinotReader) GetFilteredSpansAggregates(ctx context.Context, queryParam
 	if queryParams.Dimension == "duration" {
 		switch queryParams.AggregationOption {
 		case "p50":
-			aggregation_query = "percentileest(durationNanos, 50) as float64Value "
+			aggregation_query = " percentileest(durationNano, 50) as float64Value "
 		case "p95":
-			aggregation_query = " percentileest(durationNanos, 95) as float64Value "
+			aggregation_query = " percentileest(durationNano, 95) as float64Value "
 		case "p90":
-			aggregation_query = " percentileest(durationNanos, 90) as float64Value "
+			aggregation_query = " percentileest(durationNano, 90) as float64Value "
 		case "p99":
-			aggregation_query = " percentileest(durationNanos, 99) as float64Value "
+			aggregation_query = " percentileest(durationNano, 99) as float64Value "
 		case "max":
 			aggregation_query = " max(durationNano) as value "
 		case "min":
@@ -1808,47 +1895,49 @@ func (r *PinotReader) GetFilteredSpansAggregates(ctx context.Context, queryParam
 		aggregation_query = " count(*) as value "
 	}
 
-	args := []interface{}{clickhouse.Named("timestampL", strconv.FormatInt(queryParams.Start.UnixNano(), 10)), clickhouse.Named("timestampU", strconv.FormatInt(queryParams.End.UnixNano(), 10))}
+	startTimeNanos := strconv.FormatInt(queryParams.Start.UnixNano(), 10)
+	endTimeNanos := strconv.FormatInt(queryParams.End.UnixNano(), 10)
+	args := []interface{}{}
 
 	var query string
 	if queryParams.GroupBy != "" {
 		switch queryParams.GroupBy {
 		case constants.ServiceName:
-			query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %d minute) as time, serviceName as groupBy, %s FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", queryParams.StepSeconds/60, aggregation_query, r.traceDB, r.indexTable)
+			query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", serviceName as groupBy, %s FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", aggregation_query, r.indexTable, startTimeNanos, endTimeNanos)
 		case constants.HttpCode:
-			query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %d minute) as time, httpCode as groupBy, %s FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", queryParams.StepSeconds/60, aggregation_query, r.traceDB, r.indexTable)
+			query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", httpCode as groupBy, %s FROM %s WHERE \"timestamp\" >= %s  AND \"timestamp\" <= %s", aggregation_query, r.indexTable, startTimeNanos, endTimeNanos)
 		case constants.HttpMethod:
-			query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %d minute) as time, httpMethod as groupBy, %s FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", queryParams.StepSeconds/60, aggregation_query, r.traceDB, r.indexTable)
+			query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", httpMethod as groupBy, %s FROM %s WHERE \"timestamp\" >= %s  AND \"timestamp\" <= %s", aggregation_query, r.indexTable, startTimeNanos, endTimeNanos)
 		case constants.HttpUrl:
-			query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %d minute) as time, httpUrl as groupBy, %s FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", queryParams.StepSeconds/60, aggregation_query, r.traceDB, r.indexTable)
+			query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", httpUrl as groupBy, %s FROM %s WHERE \"timestamp\" >= %s  AND \"timestamp\" <= %s", aggregation_query, r.indexTable, startTimeNanos, endTimeNanos)
 		case constants.HttpRoute:
-			query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %d minute) as time, httpRoute as groupBy, %s FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", queryParams.StepSeconds/60, aggregation_query, r.traceDB, r.indexTable)
+			query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", httpRoute as groupBy, %s FROM %s WHERE \"timestamp\" >= %s  AND \"timestamp\" <= %s", aggregation_query, r.indexTable, startTimeNanos, endTimeNanos)
 		case constants.HttpHost:
-			query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %d minute) as time, httpHost as groupBy, %s FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", queryParams.StepSeconds/60, aggregation_query, r.traceDB, r.indexTable)
+			query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", httpHost as groupBy, %s FROM %s WHERE \"timestamp\" >= %s  AND \"timestamp\" <= %s", aggregation_query, r.indexTable, startTimeNanos, endTimeNanos)
 		case constants.DBName:
-			query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %d minute) as time, dbName as groupBy, %s FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", queryParams.StepSeconds/60, aggregation_query, r.traceDB, r.indexTable)
+			query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", dbName as groupBy, %s FROM %s WHERE \"timestamp\" >= %s  AND \"timestamp\" <= %s", aggregation_query, r.indexTable, startTimeNanos, endTimeNanos)
 		case constants.DBOperation:
-			query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %d minute) as time, dbOperation as groupBy, %s FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", queryParams.StepSeconds/60, aggregation_query, r.traceDB, r.indexTable)
+			query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", dbOperation as groupBy, %s FROM %s WHERE \"timestamp\" >= %s  AND \"timestamp\" <= %s", aggregation_query, r.indexTable, startTimeNanos, endTimeNanos)
 		case constants.OperationRequest:
-			query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %d minute) as time, name as groupBy, %s FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", queryParams.StepSeconds/60, aggregation_query, r.traceDB, r.indexTable)
+			query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", name as groupBy, %s FROM %s WHERE \"timestamp\" >= %s  AND \"timestamp\" <= %s", aggregation_query, r.indexTable, startTimeNanos, endTimeNanos)
 		case constants.MsgSystem:
-			query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %d minute) as time, msgSystem as groupBy, %s FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", queryParams.StepSeconds/60, aggregation_query, r.traceDB, r.indexTable)
+			query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", msgSystem as groupBy, %s FROM %s WHERE \"timestamp\" >= %s  AND \"timestamp\" <= %s", aggregation_query, r.indexTable, startTimeNanos, endTimeNanos)
 		case constants.MsgOperation:
-			query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %d minute) as time, msgOperation as groupBy, %s FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", queryParams.StepSeconds/60, aggregation_query, r.traceDB, r.indexTable)
+			query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", msgOperation as groupBy, %s FROM %s WHERE \"timestamp\" >= %s  AND \"timestamp\" <= %s", aggregation_query, r.indexTable, startTimeNanos, endTimeNanos)
 		case constants.DBSystem:
-			query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %d minute) as time, dbSystem as groupBy, %s FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", queryParams.StepSeconds/60, aggregation_query, r.traceDB, r.indexTable)
+			query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", dbSystem as groupBy, %s FROM %s WHERE \"timestamp\" >= %s  AND \"timestamp\" <= %s", aggregation_query, r.indexTable, startTimeNanos, endTimeNanos)
 		case constants.Component:
-			query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %d minute) as time, component as groupBy, %s FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", queryParams.StepSeconds/60, aggregation_query, r.traceDB, r.indexTable)
+			query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", component as groupBy, %s FROM %s WHERE \"timestamp\" >= %s  AND \"timestamp\" <= %s", aggregation_query, r.indexTable, startTimeNanos, endTimeNanos)
 		case constants.RPCMethod:
-			query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %d minute) as time, rpcMethod as groupBy, %s FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", queryParams.StepSeconds/60, aggregation_query, r.traceDB, r.indexTable)
+			query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", rpcMethod as groupBy, %s FROM %s WHERE \"timestamp\" >= %s  AND \"timestamp\" <= %s", aggregation_query, r.indexTable, startTimeNanos, endTimeNanos)
 		case constants.ResponseStatusCode:
-			query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %d minute) as time, responseStatusCode as groupBy, %s FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", queryParams.StepSeconds/60, aggregation_query, r.traceDB, r.indexTable)
+			query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", responseStatusCode as groupBy, %s FROM %s WHERE \"timestamp\" >= %s  AND \"timestamp\" <= %s", aggregation_query, r.indexTable, startTimeNanos, endTimeNanos)
 
 		default:
 			return nil, &model.ApiError{Typ: model.ErrorBadData, Err: fmt.Errorf("groupBy type: %s not supported", queryParams.GroupBy)}
 		}
 	} else {
-		query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %d minute) as time, %s FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", queryParams.StepSeconds/60, aggregation_query, r.traceDB, r.indexTable)
+		query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", 'test', %s FROM %s WHERE \"timestamp\" >= %s  AND \"timestamp\" <= %s", aggregation_query, r.indexTable, startTimeNanos, endTimeNanos)
 	}
 
 	if len(queryParams.ServiceName) > 0 {
@@ -1882,66 +1971,43 @@ func (r *PinotReader) GetFilteredSpansAggregates(ctx context.Context, queryParam
 		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.ResponseStatusCode, constants.ResponseStatusCode, &query, args)
 	}
 	if len(queryParams.MinDuration) != 0 {
-		query = query + " AND durationNano >= @durationNanoMin"
-		args = append(args, clickhouse.Named("durationNanoMin", queryParams.MinDuration))
+		query = query + " AND durationNano >= " + queryParams.MinDuration
 	}
 	if len(queryParams.MaxDuration) != 0 {
-		query = query + " AND durationNano <= @durationNanoMax"
-		args = append(args, clickhouse.Named("durationNanoMax", queryParams.MaxDuration))
+		query = query + " AND durationNano <= " + queryParams.MaxDuration
 	}
 	query = getStatusFilters(query, queryParams.Status, excludeMap)
 
 	if len(queryParams.Kind) != 0 {
-		query = query + " AND kind = @kind"
-		args = append(args, clickhouse.Named("kind", queryParams.Kind))
+		query = query + " AND kind = " + queryParams.Kind
 	}
 
-	args, errStatus := buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
-	if errStatus != nil {
-		return nil, errStatus
-	}
+	// args, errStatus := buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
+	// if errStatus != nil {
+	// 	return nil, errStatus
+	// }
 
 	if queryParams.GroupBy != "" {
-		switch queryParams.GroupBy {
-		case constants.ServiceName:
-			query = query + " GROUP BY time, serviceName as groupBy ORDER BY time"
-		case constants.HttpCode:
-			query = query + " GROUP BY time, httpCode as groupBy ORDER BY time"
-		case constants.HttpMethod:
-			query = query + " GROUP BY time, httpMethod as groupBy ORDER BY time"
-		case constants.HttpUrl:
-			query = query + " GROUP BY time, httpUrl as groupBy ORDER BY time"
-		case constants.HttpRoute:
-			query = query + " GROUP BY time, httpRoute as groupBy ORDER BY time"
-		case constants.HttpHost:
-			query = query + " GROUP BY time, httpHost as groupBy ORDER BY time"
-		case constants.DBName:
-			query = query + " GROUP BY time, dbName as groupBy ORDER BY time"
-		case constants.DBOperation:
-			query = query + " GROUP BY time, dbOperation as groupBy ORDER BY time"
-		case constants.OperationRequest:
-			query = query + " GROUP BY time, name as groupBy ORDER BY time"
-		case constants.MsgSystem:
-			query = query + " GROUP BY time, msgSystem as groupBy ORDER BY time"
-		case constants.MsgOperation:
-			query = query + " GROUP BY time, msgOperation as groupBy ORDER BY time"
-		case constants.DBSystem:
-			query = query + " GROUP BY time, dbSystem as groupBy ORDER BY time"
-		case constants.Component:
-			query = query + " GROUP BY time, component as groupBy ORDER BY time"
-		case constants.RPCMethod:
-			query = query + " GROUP BY time, rpcMethod as groupBy ORDER BY time"
-		case constants.ResponseStatusCode:
-			query = query + " GROUP BY time, responseStatusCode as groupBy ORDER BY time"
-
-		default:
-			return nil, &model.ApiError{Typ: model.ErrorBadData, Err: fmt.Errorf("groupBy type: %s not supported", queryParams.GroupBy)}
-		}
+		query = query + " GROUP BY \"time\", groupBy ORDER BY \"time\""
 	} else {
-		query = query + " GROUP BY time ORDER BY time"
+		query = query + " GROUP BY \"time\" ORDER BY \"time\""
 	}
 
-	err := r.db.Select(ctx, &SpanAggregatesDBResponseItems, query, args...)
+	query = query + " LIMIT " + DEFAULT_UNLIMITED_LIMIT
+
+	rows, err := r.db.ControllerQuery(ctx, query)
+	zap.S().Info(query)
+
+	for _, row := range rows.rows {
+		_r := row.([]interface{})
+		SpanAggregatesDBResponseItems = append(SpanAggregatesDBResponseItems, model.SpanAggregatesDBResponseItem{
+			Time:         time.Unix(0, int64(_r[0].(float64))*int64(time.Minute)),
+			GroupBy:      _r[1].(string),
+			Value:        uint64(_r[2].(float64)),
+			FloatValue:   float32(_r[2].(float64)),
+			Float64Value: _r[2].(float64),
+		})
+	}
 
 	zap.S().Info(query)
 
