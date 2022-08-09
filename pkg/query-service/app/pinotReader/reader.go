@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"reflect"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -78,6 +77,7 @@ type PinotClient struct {
 }
 
 func (r *PinotClient) ControllerQuery(ctx context.Context, query string) (PinotResponseTable, error) {
+	zap.S().Error("Querying: %s", query)
 	sqlReq := map[string]string{"sql": query}
 	jsonReq, err := json.Marshal(sqlReq)
 
@@ -140,8 +140,8 @@ func (r *PinotClient) QueryRow(ctx context.Context, query string, args ...interf
 }
 
 type PinotResponseTable struct {
-	rows               []interface{}
-	numSegmentsQueried int
+	columns []string
+	rows    []interface{}
 }
 
 type PinotRows interface {
@@ -647,64 +647,32 @@ func (r *PinotReader) CreateChannel(receiver *am.Receiver) (*am.Receiver, *model
 }
 
 func (r *PinotReader) GetInstantQueryMetricsResult(ctx context.Context, queryParams *model.InstantQueryMetricsParams) (*promql.Result, *stats.QueryStats, *model.ApiError) {
-	qry, err := r.queryEngine.NewInstantQuery(r.remoteStorage, queryParams.Query, queryParams.Time)
-	if err != nil {
-		return nil, nil, &model.ApiError{Typ: model.ErrorBadData, Err: err}
-	}
-
-	res := qry.Exec(ctx)
-
-	// Optional stats field in response if parameter "stats" is not empty.
-	var qs *stats.QueryStats
-	if queryParams.Stats != "" {
-		qs = stats.NewQueryStats(qry.Stats())
-	}
-
-	qry.Close()
-	return res, qs, nil
-
+	return nil, nil, &model.ApiError{Typ: model.ErrorNotImplemented, Err: fmt.Errorf("Metrics not supported")}
 }
 
 func (r *PinotReader) GetQueryRangeResult(ctx context.Context, query *model.QueryRangeParams) (*promql.Result, *stats.QueryStats, *model.ApiError) {
-
-	qry, err := r.queryEngine.NewRangeQuery(r.remoteStorage, query.Query, query.Start, query.End, query.Step)
-
-	if err != nil {
-		return nil, nil, &model.ApiError{Typ: model.ErrorBadData, Err: err}
-	}
-
-	res := qry.Exec(ctx)
-
-	// Optional stats field in response if parameter "stats" is not empty.
-	var qs *stats.QueryStats
-	if query.Stats != "" {
-		qs = stats.NewQueryStats(qry.Stats())
-	}
-
-	qry.Close()
-	return res, qs, nil
+	return nil, nil, &model.ApiError{Typ: model.ErrorNotImplemented, Err: fmt.Errorf("Metrics not supported")}
 }
 
 func (r *PinotReader) GetServicesList(ctx context.Context) (*[]string, error) {
 
+	// TODO check the where clause support
 	services := []string{}
 	query := fmt.Sprintf(`SELECT DISTINCT serviceName FROM %s`, r.indexTable)
 
-	// This is where pinot it being queried. We want to return rows as a list
 	rows, err := r.db.ControllerQuery(ctx, query)
 
 	zap.S().Info(query)
 
 	if err != nil {
-		zap.S().Debug("error in processing sql query: ", err)
+		zap.S().Debug("Error in processing sql query: ", err)
 		return nil, fmt.Errorf("Error in processing sql query")
 	}
 
 	for _, row := range rows.rows {
-		for _, v := range row.([]interface{}) {
-			services = append(services, v.(string))
-		}
+		_r := row.([]interface{})
 
+		services = append(services, _r[0].(string))
 	}
 
 	return &services, nil
@@ -718,14 +686,25 @@ func (r *PinotReader) GetServices(ctx context.Context, queryParams *model.GetSer
 
 	serviceItems := []model.ServiceItem{}
 
-	query := fmt.Sprintf("SELECT serviceName, quantile(0.99)(durationNano) as p99, avg(durationNano) as avgDuration, count(*) as numCalls FROM %s.%s WHERE timestamp>='%s' AND timestamp<='%s' AND kind='2'", r.traceDB, r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10))
-	args := []interface{}{}
-	args, errStatus := buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
-	if errStatus != nil {
-		return nil, errStatus
-	}
+	query := fmt.Sprintf("SELECT serviceName, percentileest(durationNanos, 99) as p99, avg(durationNanos) as avgDuration, count(*) as numCalls FROM %s WHERE \"timestamp\">=%s AND \"timestamp\"<=%s AND kind='2'", r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10))
+	// args := []interface{}{}
+	// args, errStatus := buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
+	// if errStatus != nil {
+	// 	return nil, errStatus
+	// }
 	query += " GROUP BY serviceName ORDER BY p99 DESC"
-	err := r.db.Select(ctx, &serviceItems, query, args...)
+	rows, err := r.db.ControllerQuery(ctx, query)
+
+	for _, row := range rows.rows {
+		_r := row.([]interface{})
+
+		serviceItems = append(serviceItems, model.ServiceItem{
+			ServiceName:  _r[0].(string),
+			Percentile99: _r[1].(float64),
+			AvgDuration:  _r[2].(float64),
+			NumCalls:     uint64(_r[3].(float64)),
+		})
+	}
 
 	zap.S().Info(query)
 
@@ -737,14 +716,23 @@ func (r *PinotReader) GetServices(ctx context.Context, queryParams *model.GetSer
 	//////////////////		Below block gets 5xx of services
 	serviceErrorItems := []model.ServiceItem{}
 
-	query = fmt.Sprintf("SELECT serviceName, count(*) as numErrors FROM %s.%s WHERE timestamp>='%s' AND timestamp<='%s' AND kind='2' AND (statusCode>=500 OR statusCode=2)", r.traceDB, r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10))
-	args = []interface{}{}
-	args, errStatus = buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
-	if errStatus != nil {
-		return nil, errStatus
-	}
+	query = fmt.Sprintf("SELECT serviceName, count(*) as numErrors FROM %s WHERE \"timestamp\">=%s AND \"timestamp\"<=%s AND kind='2' AND (statusCode>=500 OR statusCode=2)", r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10))
+	// args = []interface{}{}
+	// args, errStatus = buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
+	// if errStatus != nil {
+	// 	return nil, errStatus
+	// }
 	query += " GROUP BY serviceName"
-	err = r.db.Select(ctx, &serviceErrorItems, query, args...)
+	rows, err = r.db.ControllerQuery(ctx, query)
+
+	for _, row := range rows.rows {
+		_r := row.([]interface{})
+
+		serviceErrorItems = append(serviceErrorItems, model.ServiceItem{
+			ServiceName: _r[0].(string),
+			NumErrors:   _r[1].(uint64),
+		})
+	}
 
 	zap.S().Info(query)
 
@@ -764,14 +752,23 @@ func (r *PinotReader) GetServices(ctx context.Context, queryParams *model.GetSer
 
 	service4xxItems := []model.ServiceItem{}
 
-	query = fmt.Sprintf("SELECT serviceName, count(*) as num4xx FROM %s.%s WHERE timestamp>='%s' AND timestamp<='%s' AND kind='2' AND statusCode>=400 AND statusCode<500", r.traceDB, r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10))
-	args = []interface{}{}
-	args, errStatus = buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
-	if errStatus != nil {
-		return nil, errStatus
-	}
+	query = fmt.Sprintf("SELECT serviceName, count(*) as num4xx FROM %s WHERE \"timestamp\">=%s AND \"timestamp\"<=%s AND kind='2' AND statusCode>=400 AND statusCode<500", r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10))
+	// args = []interface{}{}
+	// args, errStatus = buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
+	// if errStatus != nil {
+	// 	return nil, errStatus
+	// }
 	query += " GROUP BY serviceName"
-	err = r.db.Select(ctx, &service4xxItems, query, args...)
+	rows, err = r.db.ControllerQuery(ctx, query)
+
+	for _, row := range rows.rows {
+		_r := row.([]interface{})
+
+		service4xxItems = append(service4xxItems, model.ServiceItem{
+			ServiceName: _r[0].(string),
+			NumErrors:   _r[1].(uint64),
+		})
+	}
 
 	zap.S().Info(query)
 
@@ -805,14 +802,26 @@ func (r *PinotReader) GetServiceOverview(ctx context.Context, queryParams *model
 
 	serviceOverviewItems := []model.ServiceOverviewItem{}
 
-	query := fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %s minute) as time, quantile(0.99)(durationNano) as p99, quantile(0.95)(durationNano) as p95,quantile(0.50)(durationNano) as p50, count(*) as numCalls FROM %s.%s WHERE timestamp>='%s' AND timestamp<='%s' AND kind='2' AND serviceName='%s'", strconv.Itoa(int(queryParams.StepSeconds/60)), r.traceDB, r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10), queryParams.ServiceName)
-	args := []interface{}{}
-	args, errStatus := buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
-	if errStatus != nil {
-		return nil, errStatus
+	query := fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", percentileest(durationNanos, 50) as p50, percentileest(durationNanos, 95) as p95, percentileest(durationNanos, 99) as p99, count(*) as numCalls FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s AND kind = '2' AND serviceName = '%s'", r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10), queryParams.ServiceName)
+	// args := []interface{}{}
+	// args, errStatus := buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
+	// if errStatus != nil {
+	// 	return nil, errStatus
+	// }
+	query += " GROUP BY \"time\" ORDER BY \"time\" DESC"
+	rows, err := r.db.ControllerQuery(ctx, query)
+
+	for _, row := range rows.rows {
+		_r := row.([]interface{})
+
+		serviceOverviewItems = append(serviceOverviewItems, model.ServiceOverviewItem{
+			Time:         time.Unix(0, int64(_r[0].(float64))*int64(time.Minute)),
+			Percentile50: _r[1].(float64),
+			Percentile95: _r[2].(float64),
+			Percentile99: _r[3].(float64),
+			NumCalls:     uint64(_r[4].(float64)),
+		})
 	}
-	query += " GROUP BY time ORDER BY time DESC"
-	err := r.db.Select(ctx, &serviceOverviewItems, query, args...)
 
 	zap.S().Info(query)
 
@@ -823,14 +832,22 @@ func (r *PinotReader) GetServiceOverview(ctx context.Context, queryParams *model
 
 	serviceErrorItems := []model.ServiceErrorItem{}
 
-	query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %s minute) as time, count(*) as numErrors FROM %s.%s WHERE timestamp>='%s' AND timestamp<='%s' AND kind='2' AND serviceName='%s' AND hasError=true", strconv.Itoa(int(queryParams.StepSeconds/60)), r.traceDB, r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10), queryParams.ServiceName)
-	args = []interface{}{}
-	args, errStatus = buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
-	if errStatus != nil {
-		return nil, errStatus
+	query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') AS \"time\", count(*) as numErrors FROM %s WHERE \"timestamp\">=%s AND \"timestamp\"<=%s AND kind='2' AND serviceName='%s' AND hasError=true", r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10), queryParams.ServiceName)
+	// args = []interface{}{}
+	// args, errStatus = buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
+	// if errStatus != nil {
+	// 	return nil, errStatus
+	// }
+	query += " GROUP BY \"time\" ORDER BY \"time\" DESC"
+	rows, err = r.db.ControllerQuery(ctx, query)
+
+	for _, row := range rows.rows {
+		_r := row.([]interface{})
+		serviceErrorItems = append(serviceErrorItems, model.ServiceErrorItem{
+			Time:      time.Unix(0, int64(_r[0].(float64))*int64(time.Minute)),
+			NumErrors: uint64(_r[1].(float64)),
+		})
 	}
-	query += " GROUP BY time ORDER BY time DESC"
-	err = r.db.Select(ctx, &serviceErrorItems, query, args...)
 
 	zap.S().Info(query)
 
@@ -860,25 +877,23 @@ func (r *PinotReader) GetServiceOverview(ctx context.Context, queryParams *model
 
 func buildFilterArrayQuery(ctx context.Context, excludeMap map[string]struct{}, params []string, filter string, query *string, args []interface{}) []interface{} {
 	for i, e := range params {
-		filterKey := filter + String(5)
 		if i == 0 && i == len(params)-1 {
 			if _, ok := excludeMap[filter]; ok {
-				*query += fmt.Sprintf(" AND NOT (%s=@%s)", filter, filterKey)
+				*query += fmt.Sprintf(" AND NOT (%s='%s')", filter, e)
 			} else {
-				*query += fmt.Sprintf(" AND (%s=@%s)", filter, filterKey)
+				*query += fmt.Sprintf(" AND (%s='%s')", filter, e)
 			}
 		} else if i == 0 && i != len(params)-1 {
 			if _, ok := excludeMap[filter]; ok {
-				*query += fmt.Sprintf(" AND NOT (%s=@%s", filter, filterKey)
+				*query += fmt.Sprintf(" AND NOT (%s='%s'", filter, e)
 			} else {
-				*query += fmt.Sprintf(" AND (%s=@%s", filter, filterKey)
+				*query += fmt.Sprintf(" AND (%s='%s'", filter, e)
 			}
 		} else if i != 0 && i == len(params)-1 {
-			*query += fmt.Sprintf(" OR %s=@%s)", filter, filterKey)
+			*query += fmt.Sprintf(" OR %s='%s')", filter, e)
 		} else {
-			*query += fmt.Sprintf(" OR %s=@%s", filter, filterKey)
+			*query += fmt.Sprintf(" OR %s='%s'", filter, e)
 		}
-		args = append(args, clickhouse.Named(filterKey, e))
 	}
 	return args
 }
@@ -895,7 +910,10 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 		excludeMap[e] = struct{}{}
 	}
 
-	args := []interface{}{clickhouse.Named("timestampL", strconv.FormatInt(queryParams.Start.UnixNano(), 10)), clickhouse.Named("timestampU", strconv.FormatInt(queryParams.End.UnixNano(), 10))}
+	startTimeNanos := strconv.FormatInt(queryParams.Start.UnixNano(), 10)
+	endTimeNanos := strconv.FormatInt(queryParams.End.UnixNano(), 10)
+
+	args := []interface{}{}
 	if len(queryParams.ServiceName) > 0 {
 		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.ServiceName, constants.ServiceName, &query, args)
 	}
@@ -928,12 +946,10 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 	}
 
 	if len(queryParams.MinDuration) != 0 {
-		query = query + " AND durationNano >= @durationNanoMin"
-		args = append(args, clickhouse.Named("durationNanoMin", queryParams.MinDuration))
+		query = query + " AND durationNanos >= " + queryParams.MinDuration
 	}
 	if len(queryParams.MaxDuration) != 0 {
-		query = query + " AND durationNano <= @durationNanoMax"
-		args = append(args, clickhouse.Named("durationNanoMax", queryParams.MaxDuration))
+		query = query + " AND durationNanos <= " + queryParams.MinDuration
 	}
 
 	query = getStatusFilters(query, queryParams.Status, excludeMap)
@@ -956,12 +972,20 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 	for _, e := range queryParams.GetFilters {
 		switch e {
 		case constants.ServiceName:
-			finalQuery := fmt.Sprintf("SELECT serviceName, count() as count FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", r.traceDB, r.indexTable)
+			finalQuery := fmt.Sprintf("SELECT serviceName, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
 			finalQuery += " GROUP BY serviceName"
 			var dBResponse []model.DBResponseServiceName
-			err := r.db.Select(ctx, &dBResponse, finalQuery, args...)
+			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
+
+			for _, row := range rows.rows {
+				_r := row.([]interface{})
+				dBResponse = append(dBResponse, model.DBResponseServiceName{
+					ServiceName: _r[0].(string),
+					Count:       uint64(_r[1].(float64)),
+				})
+			}
 
 			if err != nil {
 				zap.S().Debug("Error in processing sql query: ", err)
@@ -973,12 +997,20 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 				}
 			}
 		case constants.HttpCode:
-			finalQuery := fmt.Sprintf("SELECT httpCode, count() as count FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", r.traceDB, r.indexTable)
+			finalQuery := fmt.Sprintf("SELECT httpCode, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
 			finalQuery += " GROUP BY httpCode"
 			var dBResponse []model.DBResponseHttpCode
-			err := r.db.Select(ctx, &dBResponse, finalQuery, args...)
+			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
+
+			for _, row := range rows.rows {
+				_r := row.([]interface{})
+				dBResponse = append(dBResponse, model.DBResponseHttpCode{
+					HttpCode: _r[0].(string),
+					Count:    uint64(_r[1].(float64)),
+				})
+			}
 
 			if err != nil {
 				zap.S().Debug("Error in processing sql query: ", err)
@@ -990,12 +1022,20 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 				}
 			}
 		case constants.HttpRoute:
-			finalQuery := fmt.Sprintf("SELECT httpRoute, count() as count FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", r.traceDB, r.indexTable)
+			finalQuery := fmt.Sprintf("SELECT httpRoute, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
 			finalQuery += " GROUP BY httpRoute"
 			var dBResponse []model.DBResponseHttpRoute
-			err := r.db.Select(ctx, &dBResponse, finalQuery, args...)
+			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
+
+			for _, row := range rows.rows {
+				_r := row.([]interface{})
+				dBResponse = append(dBResponse, model.DBResponseHttpRoute{
+					HttpRoute: _r[0].(string),
+					Count:     uint64(_r[1].(float64)),
+				})
+			}
 
 			if err != nil {
 				zap.S().Debug("Error in processing sql query: ", err)
@@ -1007,13 +1047,20 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 				}
 			}
 		case constants.HttpUrl:
-			finalQuery := fmt.Sprintf("SELECT httpUrl, count() as count FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", r.traceDB, r.indexTable)
+			finalQuery := fmt.Sprintf("SELECT httpUrl, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
 			finalQuery += " GROUP BY httpUrl"
 			var dBResponse []model.DBResponseHttpUrl
-			err := r.db.Select(ctx, &dBResponse, finalQuery, args...)
+			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
 
+			for _, row := range rows.rows {
+				_r := row.([]interface{})
+				dBResponse = append(dBResponse, model.DBResponseHttpUrl{
+					HttpUrl: _r[0].(string),
+					Count:   uint64(_r[1].(float64)),
+				})
+			}
 			if err != nil {
 				zap.S().Debug("Error in processing sql query: ", err)
 				return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("Error in processing sql query: %s", err)}
@@ -1024,12 +1071,20 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 				}
 			}
 		case constants.HttpMethod:
-			finalQuery := fmt.Sprintf("SELECT httpMethod, count() as count FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", r.traceDB, r.indexTable)
+			finalQuery := fmt.Sprintf("SELECT httpMethod, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
 			finalQuery += " GROUP BY httpMethod"
 			var dBResponse []model.DBResponseHttpMethod
-			err := r.db.Select(ctx, &dBResponse, finalQuery, args...)
+			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
+
+			for _, row := range rows.rows {
+				_r := row.([]interface{})
+				dBResponse = append(dBResponse, model.DBResponseHttpMethod{
+					HttpMethod: _r[0].(string),
+					Count:      uint64(_r[1].(float64)),
+				})
+			}
 
 			if err != nil {
 				zap.S().Debug("Error in processing sql query: ", err)
@@ -1041,12 +1096,20 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 				}
 			}
 		case constants.HttpHost:
-			finalQuery := fmt.Sprintf("SELECT httpHost, count() as count FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", r.traceDB, r.indexTable)
+			finalQuery := fmt.Sprintf("SELECT httpHost, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
 			finalQuery += " GROUP BY httpHost"
 			var dBResponse []model.DBResponseHttpHost
-			err := r.db.Select(ctx, &dBResponse, finalQuery, args...)
+			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
+
+			for _, row := range rows.rows {
+				_r := row.([]interface{})
+				dBResponse = append(dBResponse, model.DBResponseHttpHost{
+					HttpHost: _r[0].(string),
+					Count:    uint64(_r[1].(float64)),
+				})
+			}
 
 			if err != nil {
 				zap.S().Debug("Error in processing sql query: ", err)
@@ -1058,12 +1121,20 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 				}
 			}
 		case constants.OperationRequest:
-			finalQuery := fmt.Sprintf("SELECT name, count() as count FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", r.traceDB, r.indexTable)
+			finalQuery := fmt.Sprintf("SELECT name, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
 			finalQuery += " GROUP BY name"
 			var dBResponse []model.DBResponseOperation
-			err := r.db.Select(ctx, &dBResponse, finalQuery, args...)
+			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
+
+			for _, row := range rows.rows {
+				_r := row.([]interface{})
+				dBResponse = append(dBResponse, model.DBResponseOperation{
+					Operation: _r[0].(string),
+					Count:     uint64(_r[1].(float64)),
+				})
+			}
 
 			if err != nil {
 				zap.S().Debug("Error in processing sql query: ", err)
@@ -1075,12 +1146,20 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 				}
 			}
 		case constants.Component:
-			finalQuery := fmt.Sprintf("SELECT component, count() as count FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", r.traceDB, r.indexTable)
+			finalQuery := fmt.Sprintf("SELECT component, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
 			finalQuery += " GROUP BY component"
 			var dBResponse []model.DBResponseComponent
-			err := r.db.Select(ctx, &dBResponse, finalQuery, args...)
+			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
+
+			for _, row := range rows.rows {
+				_r := row.([]interface{})
+				dBResponse = append(dBResponse, model.DBResponseComponent{
+					Component: _r[0].(string),
+					Count:     uint64(_r[1].(float64)),
+				})
+			}
 
 			if err != nil {
 				zap.S().Debug("Error in processing sql query: ", err)
@@ -1092,22 +1171,36 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 				}
 			}
 		case constants.Status:
-			finalQuery := fmt.Sprintf("SELECT COUNT(*) as numTotal FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU AND hasError = true", r.traceDB, r.indexTable)
+			finalQuery := fmt.Sprintf("SELECT COUNT(*) as numTotal FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s AND hasError = true", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
 			var dBResponse []model.DBResponseTotal
-			err := r.db.Select(ctx, &dBResponse, finalQuery, args...)
+			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
+
+			for _, row := range rows.rows {
+				_r := row.([]interface{})
+				dBResponse = append(dBResponse, model.DBResponseTotal{
+					NumTotal: uint64(_r[0].(float64)),
+				})
+			}
 
 			if err != nil {
 				zap.S().Debug("Error in processing sql query: ", err)
 				return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("Error in processing sql query: %s", err)}
 			}
 
-			finalQuery2 := fmt.Sprintf("SELECT COUNT(*) as numTotal FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU AND hasError = false", r.traceDB, r.indexTable)
+			finalQuery2 := fmt.Sprintf("SELECT COUNT(*) as numTotal FROM %s WHERE timestamp >= %s AND timestamp <= %s AND hasError = false", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery2 += query
 			var dBResponse2 []model.DBResponseTotal
-			err = r.db.Select(ctx, &dBResponse2, finalQuery2, args...)
-			zap.S().Info(finalQuery2)
+			rows, err = r.db.ControllerQuery(ctx, finalQuery)
+			zap.S().Info(finalQuery)
+
+			for _, row := range rows.rows {
+				_r := row.([]interface{})
+				dBResponse2 = append(dBResponse2, model.DBResponseTotal{
+					NumTotal: uint64(_r[0].(float64)),
+				})
+			}
 
 			if err != nil {
 				zap.S().Debug("Error in processing sql query: ", err)
@@ -1123,23 +1216,37 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 				traceFilterReponse.Status = map[string]uint64{"ok": 0, "error": 0}
 			}
 		case constants.Duration:
-			finalQuery := fmt.Sprintf("SELECT durationNano as numTotal FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", r.traceDB, r.durationTable)
+			finalQuery := fmt.Sprintf("SELECT durationNanos as numTotal FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
-			finalQuery += " ORDER BY durationNano LIMIT 1"
+			finalQuery += " ORDER BY durationNanos LIMIT 1"
 			var dBResponse []model.DBResponseTotal
-			err := r.db.Select(ctx, &dBResponse, finalQuery, args...)
+			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
+
+			for _, row := range rows.rows {
+				_r := row.([]interface{})
+				dBResponse = append(dBResponse, model.DBResponseTotal{
+					NumTotal: uint64(_r[0].(float64)),
+				})
+			}
 
 			if err != nil {
 				zap.S().Debug("Error in processing sql query: ", err)
 				return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("Error in processing sql query: %s", err)}
 			}
-			finalQuery = fmt.Sprintf("SELECT durationNano as numTotal FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", r.traceDB, r.durationTable)
+			finalQuery = fmt.Sprintf("SELECT durationNanos as numTotal FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
-			finalQuery += " ORDER BY durationNano DESC LIMIT 1"
+			finalQuery += " ORDER BY durationNanos DESC LIMIT 1"
 			var dBResponse2 []model.DBResponseTotal
-			err = r.db.Select(ctx, &dBResponse2, finalQuery, args...)
+			rows, err = r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
+
+			for _, row := range rows.rows {
+				_r := row.([]interface{})
+				dBResponse2 = append(dBResponse2, model.DBResponseTotal{
+					NumTotal: uint64(_r[0].(float64)),
+				})
+			}
 
 			if err != nil {
 				zap.S().Debug("Error in processing sql query: ", err)
@@ -1152,12 +1259,20 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 				traceFilterReponse.Duration["maxDuration"] = dBResponse2[0].NumTotal
 			}
 		case constants.RPCMethod:
-			finalQuery := fmt.Sprintf("SELECT rpcMethod, count() as count FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", r.traceDB, r.indexTable)
+			finalQuery := fmt.Sprintf("SELECT rpcMethod, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
 			finalQuery += " GROUP BY rpcMethod"
 			var dBResponse []model.DBResponseRPCMethod
-			err := r.db.Select(ctx, &dBResponse, finalQuery, args...)
+			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
+
+			for _, row := range rows.rows {
+				_r := row.([]interface{})
+				dBResponse = append(dBResponse, model.DBResponseRPCMethod{
+					RPCMethod: _r[0].(string),
+					Count:     uint64(_r[1].(float64)),
+				})
+			}
 
 			if err != nil {
 				zap.S().Debug("Error in processing sql query: ", err)
@@ -1170,12 +1285,20 @@ func (r *PinotReader) GetSpanFilters(ctx context.Context, queryParams *model.Spa
 			}
 
 		case constants.ResponseStatusCode:
-			finalQuery := fmt.Sprintf("SELECT responseStatusCode, count() as count FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", r.traceDB, r.indexTable)
+			finalQuery := fmt.Sprintf("SELECT responseStatusCode, count(*) as count FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", r.indexTable, startTimeNanos, endTimeNanos)
 			finalQuery += query
 			finalQuery += " GROUP BY responseStatusCode"
 			var dBResponse []model.DBResponseStatusCodeMethod
-			err := r.db.Select(ctx, &dBResponse, finalQuery, args...)
+			rows, err := r.db.ControllerQuery(ctx, finalQuery)
 			zap.S().Info(finalQuery)
+
+			for _, row := range rows.rows {
+				_r := row.([]interface{})
+				dBResponse = append(dBResponse, model.DBResponseStatusCodeMethod{
+					ResponseStatusCode: _r[0].(string),
+					Count:              uint64(_r[1].(float64)),
+				})
+			}
 
 			if err != nil {
 				zap.S().Debug("Error in processing sql query: ", err)
@@ -1218,7 +1341,7 @@ func getStatusFilters(query string, statusParams []string, excludeMap map[string
 
 func (r *PinotReader) GetFilteredSpans(ctx context.Context, queryParams *model.GetFilteredSpansParams) (*model.GetFilterSpansResponse, *model.ApiError) {
 
-	queryTable := fmt.Sprintf("%s.%s", r.traceDB, r.indexTable)
+	queryTable := fmt.Sprintf("%s", r.indexTable)
 
 	excludeMap := make(map[string]struct{})
 	for _, e := range queryParams.Exclude {
@@ -1229,8 +1352,11 @@ func (r *PinotReader) GetFilteredSpans(ctx context.Context, queryParams *model.G
 		excludeMap[e] = struct{}{}
 	}
 
+	startTimeNanos := strconv.FormatInt(queryParams.Start.UnixNano(), 10)
+	endTimeNanos := strconv.FormatInt(queryParams.End.UnixNano(), 10)
+
 	var query string
-	args := []interface{}{clickhouse.Named("timestampL", strconv.FormatInt(queryParams.Start.UnixNano(), 10)), clickhouse.Named("timestampU", strconv.FormatInt(queryParams.End.UnixNano(), 10))}
+	args := []interface{}{}
 	if len(queryParams.ServiceName) > 0 {
 		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.ServiceName, constants.ServiceName, &query, args)
 	}
@@ -1264,68 +1390,81 @@ func (r *PinotReader) GetFilteredSpans(ctx context.Context, queryParams *model.G
 	}
 
 	if len(queryParams.MinDuration) != 0 {
-		query = query + " AND durationNano >= @durationNanoMin"
-		args = append(args, clickhouse.Named("durationNanoMin", queryParams.MinDuration))
+		query = query + " AND durationNanos >= " + queryParams.MinDuration
 	}
 	if len(queryParams.MaxDuration) != 0 {
-		query = query + " AND durationNano <= @durationNanoMax"
-		args = append(args, clickhouse.Named("durationNanoMax", queryParams.MaxDuration))
+		query = query + " AND durationNanos <= " + queryParams.MaxDuration
 	}
 	query = getStatusFilters(query, queryParams.Status, excludeMap)
 
 	if len(queryParams.Kind) != 0 {
-		query = query + " AND kind = @kind"
-		args = append(args, clickhouse.Named("kind", queryParams.Kind))
+		query = query + " AND kind = " + queryParams.Kind
 	}
 
-	args, errStatus := buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
-	if errStatus != nil {
-		return nil, errStatus
-	}
+	// args, errStatus := buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
+	// if errStatus != nil {
+	// 	return nil, errStatus
+	// }
 
 	if len(queryParams.OrderParam) != 0 {
 		if queryParams.OrderParam == constants.Duration {
-			queryTable = fmt.Sprintf("%s.%s", r.traceDB, r.durationTable)
 			if queryParams.Order == constants.Descending {
-				query = query + " ORDER BY durationNano DESC"
+				query = query + " ORDER BY durationNanos DESC"
 			}
 			if queryParams.Order == constants.Ascending {
-				query = query + " ORDER BY durationNano ASC"
+				query = query + " ORDER BY durationNanos ASC"
 			}
 		} else if queryParams.OrderParam == constants.Timestamp {
-			// projectionOptQuery := "SET allow_experimental_projection_optimization = 1"
-			// Probably not supported by Pinot?
-			// err := r.db.Exec(ctx, projectionOptQuery)
-
-			// zap.S().Info(projectionOptQuery)
-
-			// if err != nil {
-			// 	zap.S().Debug("Error in processing sql query: ", err)
-			// 	return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("Error in processing sql query")}
-			// }
 			if queryParams.Order == constants.Descending {
-				query = query + " ORDER BY timestamp DESC"
+				query = query + " ORDER BY \"timestamp\" DESC"
 			}
 			if queryParams.Order == constants.Ascending {
-				query = query + " ORDER BY timestamp ASC"
+				query = query + " ORDER BY \"timestamp\" ASC"
 			}
 		}
 	}
 	if queryParams.Limit > 0 {
-		query = query + " LIMIT @limit"
-		args = append(args, clickhouse.Named("limit", queryParams.Limit))
+		query = query + " LIMIT " + strconv.FormatInt(queryParams.Limit, 10)
 	}
 
-	if queryParams.Offset > 0 {
-		query = query + " OFFSET @offset"
-		args = append(args, clickhouse.Named("offset", queryParams.Offset))
-	}
+	// if queryParams.Offset > 0 {
+	// 	query = query + " OFFSET @offset"
+	// 	args = append(args, clickhouse.Named("offset", queryParams.Offset))
+	// }
 
 	var getFilterSpansResponseItems []model.GetFilterSpansResponseItem
 
-	baseQuery := fmt.Sprintf("SELECT timestamp, spanID, traceID, serviceName, name, durationNano, httpCode, gRPCCode, gRPCMethod, httpMethod, rpcMethod, responseStatusCode FROM %s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", queryTable)
+	baseQuery := fmt.Sprintf("SELECT \"timestamp\", spanID, traceID, serviceName, name, durationNanos, httpCode, gRPCCode, gRPCMethod, httpMethod, rpcMethod, responseStatusCode FROM %s WHERE \"timestamp\" >= %s AND \"timestamp\" <= %s", queryTable, startTimeNanos, endTimeNanos)
 	baseQuery += query
-	err := r.db.Select(ctx, &getFilterSpansResponseItems, baseQuery, args...)
+
+	rows, err := r.db.ControllerQuery(ctx, baseQuery)
+
+	if err != nil {
+		//
+	}
+
+	for _, row := range rows.rows {
+		_r := row.([]interface{})
+
+		if err != nil {
+			//
+		}
+
+		getFilterSpansResponseItems = append(getFilterSpansResponseItems, model.GetFilterSpansResponseItem{
+			Timestamp:          time.Unix(0, int64(_r[0].(float64))),
+			SpanID:             _r[1].(string),
+			TraceID:            _r[2].(string),
+			ServiceName:        _r[3].(string),
+			Operation:          _r[4].(string),
+			DurationNano:       uint64(_r[5].(float64)),
+			HttpCode:           _r[6].(string),
+			GRPCode:            _r[7].(string),
+			GRPMethod:          _r[8].(string),
+			HttpMethod:         _r[9].(string),
+			RPCMethod:          _r[10].(string),
+			ResponseStatusCode: _r[11].(string),
+		})
+	}
 	// Fill status and method
 	for i, e := range getFilterSpansResponseItems {
 		if e.GRPCode != "" {
@@ -1410,75 +1549,7 @@ func buildQueryWithTagParams(ctx context.Context, tags []model.TagQuery, query *
 }
 
 func (r *PinotReader) GetTagFilters(ctx context.Context, queryParams *model.TagFilterParams) (*[]model.TagFilters, *model.ApiError) {
-
-	excludeMap := make(map[string]struct{})
-	for _, e := range queryParams.Exclude {
-		if e == constants.OperationRequest {
-			excludeMap[constants.OperationDB] = struct{}{}
-			continue
-		}
-		excludeMap[e] = struct{}{}
-	}
-
-	var query string
-	args := []interface{}{clickhouse.Named("timestampL", strconv.FormatInt(queryParams.Start.UnixNano(), 10)), clickhouse.Named("timestampU", strconv.FormatInt(queryParams.End.UnixNano(), 10))}
-	if len(queryParams.ServiceName) > 0 {
-		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.ServiceName, constants.ServiceName, &query, args)
-	}
-	if len(queryParams.HttpRoute) > 0 {
-		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.HttpRoute, constants.HttpRoute, &query, args)
-	}
-	if len(queryParams.HttpCode) > 0 {
-		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.HttpCode, constants.HttpCode, &query, args)
-	}
-	if len(queryParams.HttpHost) > 0 {
-		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.HttpHost, constants.HttpHost, &query, args)
-	}
-	if len(queryParams.HttpMethod) > 0 {
-		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.HttpMethod, constants.HttpMethod, &query, args)
-	}
-	if len(queryParams.HttpUrl) > 0 {
-		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.HttpUrl, constants.HttpUrl, &query, args)
-	}
-	if len(queryParams.Component) > 0 {
-		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.Component, constants.Component, &query, args)
-	}
-	if len(queryParams.Operation) > 0 {
-		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.Operation, constants.OperationDB, &query, args)
-	}
-	if len(queryParams.RPCMethod) > 0 {
-		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.RPCMethod, constants.RPCMethod, &query, args)
-	}
-	if len(queryParams.ResponseStatusCode) > 0 {
-		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.ResponseStatusCode, constants.ResponseStatusCode, &query, args)
-	}
-	if len(queryParams.MinDuration) != 0 {
-		query = query + " AND durationNano >= @durationNanoMin"
-		args = append(args, clickhouse.Named("durationNanoMin", queryParams.MinDuration))
-	}
-	if len(queryParams.MaxDuration) != 0 {
-		query = query + " AND durationNano <= @durationNanoMax"
-		args = append(args, clickhouse.Named("durationNanoMax", queryParams.MaxDuration))
-	}
-
-	query = getStatusFilters(query, queryParams.Status, excludeMap)
-
-	tagFilters := []model.TagFilters{}
-
-	finalQuery := fmt.Sprintf(`SELECT DISTINCT arrayJoin(tagMap.keys) as tagKeys FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU`, r.traceDB, r.indexTable)
-	// Alternative query: SELECT groupUniqArrayArray(mapKeys(tagMap)) as tagKeys  FROM signoz_index_v2
-	finalQuery += query
-	err := r.db.Select(ctx, &tagFilters, finalQuery, args...)
-
-	zap.S().Info(query)
-
-	if err != nil {
-		zap.S().Debug("Error in processing sql query: ", err)
-		return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("Error in processing sql query")}
-	}
-	tagFilters = excludeTags(ctx, tagFilters)
-
-	return &tagFilters, nil
+	return nil, &model.ApiError{model.ErrorNotImplemented, fmt.Errorf("Pinot does not support operation")}
 }
 
 func excludeTags(ctx context.Context, tags []model.TagFilters) []model.TagFilters {
@@ -1506,89 +1577,33 @@ func excludeTags(ctx context.Context, tags []model.TagFilters) []model.TagFilter
 }
 
 func (r *PinotReader) GetTagValues(ctx context.Context, queryParams *model.TagFilterParams) (*[]model.TagValues, *model.ApiError) {
-
-	excludeMap := make(map[string]struct{})
-	for _, e := range queryParams.Exclude {
-		if e == constants.OperationRequest {
-			excludeMap[constants.OperationDB] = struct{}{}
-			continue
-		}
-		excludeMap[e] = struct{}{}
-	}
-
-	var query string
-	args := []interface{}{clickhouse.Named("timestampL", strconv.FormatInt(queryParams.Start.UnixNano(), 10)), clickhouse.Named("timestampU", strconv.FormatInt(queryParams.End.UnixNano(), 10))}
-	if len(queryParams.ServiceName) > 0 {
-		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.ServiceName, constants.ServiceName, &query, args)
-	}
-	if len(queryParams.HttpRoute) > 0 {
-		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.HttpRoute, constants.HttpRoute, &query, args)
-	}
-	if len(queryParams.HttpCode) > 0 {
-		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.HttpCode, constants.HttpCode, &query, args)
-	}
-	if len(queryParams.HttpHost) > 0 {
-		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.HttpHost, constants.HttpHost, &query, args)
-	}
-	if len(queryParams.HttpMethod) > 0 {
-		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.HttpMethod, constants.HttpMethod, &query, args)
-	}
-	if len(queryParams.HttpUrl) > 0 {
-		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.HttpUrl, constants.HttpUrl, &query, args)
-	}
-	if len(queryParams.Component) > 0 {
-		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.Component, constants.Component, &query, args)
-	}
-	if len(queryParams.Operation) > 0 {
-		args = buildFilterArrayQuery(ctx, excludeMap, queryParams.Operation, constants.OperationDB, &query, args)
-	}
-	if len(queryParams.MinDuration) != 0 {
-		query = query + " AND durationNano >= @durationNanoMin"
-		args = append(args, clickhouse.Named("durationNanoMin", queryParams.MinDuration))
-	}
-	if len(queryParams.MaxDuration) != 0 {
-		query = query + " AND durationNano <= @durationNanoMax"
-		args = append(args, clickhouse.Named("durationNanoMax", queryParams.MaxDuration))
-	}
-
-	query = getStatusFilters(query, queryParams.Status, excludeMap)
-
-	tagValues := []model.TagValues{}
-
-	finalQuery := fmt.Sprintf(`SELECT tagMap[@key] as tagValues FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU`, r.traceDB, r.indexTable)
-	finalQuery += query
-	finalQuery += " GROUP BY tagMap[@key]"
-	args = append(args, clickhouse.Named("key", queryParams.TagKey))
-	err := r.db.Select(ctx, &tagValues, finalQuery, args...)
-
-	zap.S().Info(query)
-
-	if err != nil {
-		zap.S().Debug("Error in processing sql query: ", err)
-		return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("Error in processing sql query")}
-	}
-
-	cleanedTagValues := []model.TagValues{}
-	for _, e := range tagValues {
-		if e.TagValues != "" {
-			cleanedTagValues = append(cleanedTagValues, e)
-		}
-	}
-	return &cleanedTagValues, nil
+	return nil, &model.ApiError{model.ErrorNotImplemented, fmt.Errorf("Pinot does not support operation")}
 }
 
 func (r *PinotReader) GetTopEndpoints(ctx context.Context, queryParams *model.GetTopEndpointsParams) (*[]model.TopEndpointsItem, *model.ApiError) {
 
 	var topEndpointsItems []model.TopEndpointsItem
 
-	query := fmt.Sprintf("SELECT quantile(0.5)(durationNano) as p50, quantile(0.95)(durationNano) as p95, quantile(0.99)(durationNano) as p99, COUNT(1) as numCalls, name  FROM %s.%s WHERE  timestamp >= '%s' AND timestamp <= '%s' AND  kind='2' and serviceName='%s'", r.traceDB, r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10), queryParams.ServiceName)
-	args := []interface{}{}
-	args, errStatus := buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
-	if errStatus != nil {
-		return nil, errStatus
-	}
+	query := fmt.Sprintf("SELECT percentileest(durationNanos, 50) as p50, percentileest(durationNanos, 95) as p95, percentileest(durationNanos, 99) as p99, COUNT(*) as numCalls, name  FROM %s WHERE  \"timestamp\" >= %s AND \"timestamp\" <= %s AND  kind='2' and serviceName='%s'", r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10), queryParams.ServiceName)
+	// args := []interface{}{}
+	// args, errStatus := buildQueryWithTagParams(ctx, queryParams.Tags, &query, args)
+	// if errStatus != nil {
+	// 	return nil, errStatus
+	// }
 	query += " GROUP BY name"
-	err := r.db.Select(ctx, &topEndpointsItems, query, args...)
+	rows, err := r.db.ControllerQuery(ctx, query)
+
+	for _, row := range rows.rows {
+		_r := row.([]interface{})
+
+		topEndpointsItems = append(topEndpointsItems, model.TopEndpointsItem{
+			Percentile50: _r[0].(float64),
+			Percentile95: _r[1].(float64),
+			Percentile99: _r[2].(float64),
+			NumCalls:     uint64(_r[3].(float64)),
+			Name:         _r[4].(string),
+		})
+	}
 
 	zap.S().Info(query)
 
@@ -1610,12 +1625,27 @@ func (r *PinotReader) GetUsage(ctx context.Context, queryParams *model.GetUsageP
 
 	var query string
 	if len(queryParams.ServiceName) != 0 {
-		query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %d HOUR) as time, count(1) as count FROM %s.%s WHERE serviceName='%s' AND timestamp>='%s' AND timestamp<='%s' GROUP BY time ORDER BY time ASC", queryParams.StepHour, r.traceDB, r.indexTable, queryParams.ServiceName, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10))
+		query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') as \"time\", count(*) as count FROM %s WHERE serviceName='%s' AND \"timestamp\">=%s AND \"timestamp\"<=%s GROUP BY \"time\" ORDER BY \"time\" ASC", r.indexTable, queryParams.ServiceName, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10))
 	} else {
-		query = fmt.Sprintf("SELECT toStartOfInterval(timestamp, INTERVAL %d HOUR) as time, count(1) as count FROM %s.%s WHERE timestamp>='%s' AND timestamp<='%s' GROUP BY time ORDER BY time ASC", queryParams.StepHour, r.traceDB, r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10))
+		query = fmt.Sprintf("SELECT TIMECONVERT(\"timestamp\", 'NANOSECONDS', 'MINUTES') as \"time\", count(1) as count FROM %s WHERE \"timestamp\">=%s AND \"timestamp\"<=%s GROUP BY \"time\" ORDER BY \"time\" ASC", r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10))
 	}
 
-	err := r.db.Select(ctx, &usageItems, query)
+	rows, err := r.db.ControllerQuery(ctx, query)
+
+	for _, row := range rows.rows {
+		_r := row.([]interface{})
+
+		timeMs, err := strconv.ParseInt(_r[0].(string), 10, 64)
+		if err != nil {
+			//
+		}
+		time := time.Unix(0, timeMs*int64(time.Minute))
+
+		usageItems = append(usageItems, model.UsageItem{
+			Time:  time,
+			Count: _r[1].(uint64),
+		})
+	}
 
 	zap.S().Info(query)
 
@@ -1639,9 +1669,19 @@ func (r *PinotReader) SearchTraces(ctx context.Context, traceId string) (*[]mode
 
 	var searchScanReponses []model.SearchSpanDBReponseItem
 
-	query := fmt.Sprintf("SELECT timestamp, traceID, model FROM %s.%s WHERE traceID=$1", r.traceDB, r.spansTable)
+	query := fmt.Sprintf("SELECT \"timestamp\", traceID, model FROM %s WHERE traceID='%s'", r.spansTable, traceId)
 
-	err := r.db.Select(ctx, &searchScanReponses, query, traceId)
+	rows, err := r.db.ControllerQuery(ctx, query)
+
+	for _, row := range rows.rows {
+		_r := row.([]interface{})
+
+		searchScanReponses = append(searchScanReponses, model.SearchSpanDBReponseItem{
+			Timestamp: time.Unix(0, int64(_r[0].(float64))),
+			TraceID:   _r[1].(string),
+			Model:     _r[2].(string),
+		})
+	}
 
 	zap.S().Info(query)
 
@@ -1678,9 +1718,19 @@ func interfaceArrayToStringArray(array []interface{}) []string {
 func (r *PinotReader) GetServiceMapDependencies(ctx context.Context, queryParams *model.GetServicesParams) (*[]model.ServiceMapDependencyResponseItem, error) {
 	serviceMapDependencyItems := []model.ServiceMapDependencyItem{}
 
-	query := fmt.Sprintf(`SELECT spanID, parentSpanID, serviceName FROM %s.%s WHERE timestamp>='%s' AND timestamp<='%s'`, r.traceDB, r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10))
+	query := fmt.Sprintf(`SELECT spanID, parentSpanID, serviceName FROM %s WHERE \"timestamp\">=%s AND \"timestamp\"<=%s`, r.indexTable, strconv.FormatInt(queryParams.Start.UnixNano(), 10), strconv.FormatInt(queryParams.End.UnixNano(), 10))
 
-	err := r.db.Select(ctx, &serviceMapDependencyItems, query)
+	rows, err := r.db.ControllerQuery(ctx, query)
+
+	for _, row := range rows.rows {
+		_r := row.([]interface{})
+
+		serviceMapDependencyItems = append(serviceMapDependencyItems, model.ServiceMapDependencyItem{
+			SpanId:       _r[0].(string),
+			ParentSpanId: _r[1].(string),
+			ServiceName:  _r[2].(string),
+		})
+	}
 
 	zap.S().Info(query)
 
@@ -1736,13 +1786,13 @@ func (r *PinotReader) GetFilteredSpansAggregates(ctx context.Context, queryParam
 	if queryParams.Dimension == "duration" {
 		switch queryParams.AggregationOption {
 		case "p50":
-			aggregation_query = " quantile(0.50)(durationNano) as float64Value "
+			aggregation_query = "percentileest(durationNanos, 50) as float64Value "
 		case "p95":
-			aggregation_query = " quantile(0.95)(durationNano) as float64Value "
+			aggregation_query = " percentileest(durationNanos, 95) as float64Value "
 		case "p90":
-			aggregation_query = " quantile(0.90)(durationNano) as float64Value "
+			aggregation_query = " percentileest(durationNanos, 90) as float64Value "
 		case "p99":
-			aggregation_query = " quantile(0.99)(durationNano) as float64Value "
+			aggregation_query = " percentileest(durationNanos, 99) as float64Value "
 		case "max":
 			aggregation_query = " max(durationNano) as value "
 		case "min":
@@ -2006,215 +2056,24 @@ func (r *PinotReader) setColdStorage(ctx context.Context, tableName string, cold
 
 // GetDisks returns a list of disks {name, type} configured in clickhouse DB.
 func (r *PinotReader) GetDisks(ctx context.Context) (*[]model.DiskItem, *model.ApiError) {
-	diskItems := []model.DiskItem{}
-
-	query := "SELECT name,type FROM system.disks"
-	if err := r.db.Select(ctx, &diskItems, query); err != nil {
-		zap.S().Debug("Error in processing sql query: ", err)
-		return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("error while getting disks. Err=%v", err)}
-	}
-
-	zap.S().Infof("Got response: %+v\n", diskItems)
-
-	return &diskItems, nil
+	return nil, &model.ApiError{model.ErrorNotImplemented, fmt.Errorf("Pinot does not support operation")}
 }
 
 // GetTTL returns current ttl, expected ttl and past setTTL status for metrics/traces.
 func (r *PinotReader) GetTTL(ctx context.Context, ttlParams *model.GetTTLParams) (*model.GetTTLResponseItem, *model.ApiError) {
-
-	parseTTL := func(queryResp string) (int, int) {
-
-		zap.S().Debugf("Parsing TTL from: %s", queryResp)
-		deleteTTLExp := regexp.MustCompile(`toIntervalSecond\(([0-9]*)\)`)
-		moveTTLExp := regexp.MustCompile(`toIntervalSecond\(([0-9]*)\) TO VOLUME`)
-
-		var delTTL, moveTTL int = -1, -1
-
-		m := deleteTTLExp.FindStringSubmatch(queryResp)
-		if len(m) > 1 {
-			seconds_int, err := strconv.Atoi(m[1])
-			if err != nil {
-				return -1, -1
-			}
-			delTTL = seconds_int / 3600
-		}
-
-		m = moveTTLExp.FindStringSubmatch(queryResp)
-		if len(m) > 1 {
-			seconds_int, err := strconv.Atoi(m[1])
-			if err != nil {
-				return -1, -1
-			}
-			moveTTL = seconds_int / 3600
-		}
-
-		return delTTL, moveTTL
-	}
-
-	getMetricsTTL := func() (*model.DBResponseTTL, *model.ApiError) {
-		var dbResp []model.DBResponseTTL
-
-		query := fmt.Sprintf("SELECT engine_full FROM system.tables WHERE name='%v'", signozSampleTableName)
-
-		err := r.db.Select(ctx, &dbResp, query)
-
-		if err != nil {
-			zap.S().Error(fmt.Errorf("error while getting ttl. Err=%v", err))
-			return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("error while getting ttl. Err=%v", err)}
-		}
-		if len(dbResp) == 0 {
-			return nil, nil
-		} else {
-			return &dbResp[0], nil
-		}
-	}
-
-	getTracesTTL := func() (*model.DBResponseTTL, *model.ApiError) {
-		var dbResp []model.DBResponseTTL
-
-		query := fmt.Sprintf("SELECT engine_full FROM system.tables WHERE name='%v' AND database='%v'", signozTraceTableName, signozTraceDBName)
-
-		err := r.db.Select(ctx, &dbResp, query)
-
-		if err != nil {
-			zap.S().Error(fmt.Errorf("error while getting ttl. Err=%v", err))
-			return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("error while getting ttl. Err=%v", err)}
-		}
-		if len(dbResp) == 0 {
-			return nil, nil
-		} else {
-			return &dbResp[0], nil
-		}
-	}
-
-	switch ttlParams.Type {
-	case constants.TraceTTL:
-		tableNameArray := []string{signozTraceDBName + "." + signozTraceTableName, signozTraceDBName + "." + signozDurationMVTable, signozTraceDBName + "." + signozSpansTable, signozTraceDBName + "." + signozErrorIndexTable}
-		status, err := r.setTTLQueryStatus(ctx, tableNameArray)
-		if err != nil {
-			return nil, err
-		}
-		dbResp, err := getTracesTTL()
-		if err != nil {
-			return nil, err
-		}
-		ttlQuery, err := r.checkTTLStatusItem(ctx, tableNameArray[0])
-		if err != nil {
-			return nil, err
-		}
-		ttlQuery.TTL = ttlQuery.TTL / 3600 // convert to hours
-		if ttlQuery.ColdStorageTtl != -1 {
-			ttlQuery.ColdStorageTtl = ttlQuery.ColdStorageTtl / 3600 // convert to hours
-		}
-
-		delTTL, moveTTL := parseTTL(dbResp.EngineFull)
-		return &model.GetTTLResponseItem{TracesTime: delTTL, TracesMoveTime: moveTTL, ExpectedTracesTime: ttlQuery.TTL, ExpectedTracesMoveTime: ttlQuery.ColdStorageTtl, Status: status}, nil
-
-	case constants.MetricsTTL:
-		tableNameArray := []string{signozMetricDBName + "." + signozSampleTableName}
-		status, err := r.setTTLQueryStatus(ctx, tableNameArray)
-		if err != nil {
-			return nil, err
-		}
-		dbResp, err := getMetricsTTL()
-		if err != nil {
-			return nil, err
-		}
-		ttlQuery, err := r.checkTTLStatusItem(ctx, tableNameArray[0])
-		if err != nil {
-			return nil, err
-		}
-		ttlQuery.TTL = ttlQuery.TTL / 3600 // convert to hours
-		if ttlQuery.ColdStorageTtl != -1 {
-			ttlQuery.ColdStorageTtl = ttlQuery.ColdStorageTtl / 3600 // convert to hours
-		}
-
-		delTTL, moveTTL := parseTTL(dbResp.EngineFull)
-		return &model.GetTTLResponseItem{MetricsTime: delTTL, MetricsMoveTime: moveTTL, ExpectedMetricsTime: ttlQuery.TTL, ExpectedMetricsMoveTime: ttlQuery.ColdStorageTtl, Status: status}, nil
-	default:
-		return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("error while getting ttl. ttl type should be metrics|traces, got %v",
-			ttlParams.Type)}
-	}
-
+	return nil, &model.ApiError{model.ErrorNotImplemented, fmt.Errorf("pinot does not support setting ttl configuration")}
 }
 
 func (r *PinotReader) ListErrors(ctx context.Context, queryParams *model.ListErrorsParams) (*[]model.Error, *model.ApiError) {
-
-	var getErrorResponses []model.Error
-
-	query := fmt.Sprintf("SELECT any(exceptionType) as exceptionType, any(exceptionMessage) as exceptionMessage, count() AS exceptionCount, min(timestamp) as firstSeen, max(timestamp) as lastSeen, any(serviceName) as serviceName, groupID FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU GROUP BY groupID", r.traceDB, r.errorTable)
-	args := []interface{}{clickhouse.Named("timestampL", strconv.FormatInt(queryParams.Start.UnixNano(), 10)), clickhouse.Named("timestampU", strconv.FormatInt(queryParams.End.UnixNano(), 10))}
-	if len(queryParams.OrderParam) != 0 {
-		if queryParams.Order == constants.Descending {
-			query = query + " ORDER BY " + queryParams.OrderParam + " DESC"
-		} else if queryParams.Order == constants.Ascending {
-			query = query + " ORDER BY " + queryParams.OrderParam + " ASC"
-		}
-	}
-	if queryParams.Limit > 0 {
-		query = query + " LIMIT @limit"
-		args = append(args, clickhouse.Named("limit", queryParams.Limit))
-	}
-
-	if queryParams.Offset > 0 {
-		query = query + " OFFSET @offset"
-		args = append(args, clickhouse.Named("offset", queryParams.Offset))
-	}
-
-	err := r.db.Select(ctx, &getErrorResponses, query, args...)
-	zap.S().Info(query)
-
-	if err != nil {
-		zap.S().Debug("Error in processing sql query: ", err)
-		return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("Error in processing sql query")}
-	}
-
-	return &getErrorResponses, nil
+	return nil, &model.ApiError{model.ErrorNotImplemented, fmt.Errorf("pinot does not support setting ttl configuration")}
 }
 
 func (r *PinotReader) CountErrors(ctx context.Context, queryParams *model.CountErrorsParams) (uint64, *model.ApiError) {
-
-	var errorCount uint64
-
-	// query := fmt.Sprintf("SELECT count(distinct(groupID)) FROM %s.%s WHERE timestamp >= @timestampL AND timestamp <= @timestampU", r.traceDB, r.errorTable)
-	// args := []interface{}{clickhouse.Named("timestampL", strconv.FormatInt(queryParams.Start.UnixNano(), 10)), clickhouse.Named("timestampU", strconv.FormatInt(queryParams.End.UnixNano(), 10))}
-
-	// err := r.db.QueryRow(ctx, query, args...).Scan(&errorCount)
-	// zap.S().Info(query)
-
-	// if err != nil {
-	// 	zap.S().Debug("Error in processing sql query: ", err)
-	// 	return 0, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("Error in processing sql query")}
-	// }
-
-	return errorCount, nil
+	return 0, &model.ApiError{model.ErrorNotImplemented, fmt.Errorf("pinot does not support setting ttl configuration")}
 }
 
 func (r *PinotReader) GetErrorFromErrorID(ctx context.Context, queryParams *model.GetErrorParams) (*model.ErrorWithSpan, *model.ApiError) {
-
-	if queryParams.ErrorID == "" {
-		zap.S().Debug("errorId missing from params")
-		return nil, &model.ApiError{Typ: model.ErrorBadData, Err: fmt.Errorf("ErrorID missing from params")}
-	}
-	var getErrorWithSpanReponse []model.ErrorWithSpan
-
-	query := fmt.Sprintf("SELECT * FROM %s.%s WHERE timestamp = @timestamp AND groupID = @groupID AND errorID = @errorID LIMIT 1", r.traceDB, r.errorTable)
-	args := []interface{}{clickhouse.Named("errorID", queryParams.ErrorID), clickhouse.Named("groupID", queryParams.GroupID), clickhouse.Named("timestamp", strconv.FormatInt(queryParams.Timestamp.UnixNano(), 10))}
-
-	err := r.db.Select(ctx, &getErrorWithSpanReponse, query, args...)
-	zap.S().Info(query)
-
-	if err != nil {
-		zap.S().Debug("Error in processing sql query: ", err)
-		return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("Error in processing sql query")}
-	}
-
-	if len(getErrorWithSpanReponse) > 0 {
-		return &getErrorWithSpanReponse[0], nil
-	} else {
-		return nil, &model.ApiError{Typ: model.ErrorNotFound, Err: fmt.Errorf("Error/Exception not found")}
-	}
-
+	return nil, &model.ApiError{model.ErrorNotImplemented, fmt.Errorf("pinot does not support setting ttl configuration")}
 }
 
 func (r *PinotReader) GetErrorFromGroupID(ctx context.Context, queryParams *model.GetErrorParams) (*model.ErrorWithSpan, *model.ApiError) {
