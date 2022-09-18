@@ -17,6 +17,7 @@ import (
 	"github.com/soheilhy/cmux"
 	"go.signoz.io/query-service/app/clickhouseReader"
 	"go.signoz.io/query-service/app/dashboards"
+	"go.signoz.io/query-service/app/pinotReader"
 	"go.signoz.io/query-service/constants"
 	"go.signoz.io/query-service/dao"
 	"go.signoz.io/query-service/healthcheck"
@@ -85,6 +86,12 @@ func NewServer(serverOptions *ServerOptions) (*Server, error) {
 		clickhouseReader := clickhouseReader.NewReader(localDB, serverOptions.PromConfigPath)
 		go clickhouseReader.Start()
 		reader = clickhouseReader
+	} else if storage == "pinot" {
+		// Initialize Pinot reader here
+		zap.S().Info("Using Pinot as datastore ...")
+		pinotReader := pinotReader.NewReader(localDB, serverOptions.PromConfigPath)
+		go pinotReader.Start()
+		reader = pinotReader
 	} else {
 		return nil, fmt.Errorf("Storage type: %s is not supported in query service", storage)
 	}
